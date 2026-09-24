@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from pydantic import BaseModel, Field
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -94,6 +95,60 @@ async def transcribe(audio: bytes, mime_type: str) -> str:
         ],
     )
     return response_text(response, "transcript")
+
+
+SCORE_THRESHOLD = 6
+
+SCORING_PROMPT = """\
+You screen raw notes from Meera Pillai, founder of Skinstinct (a Mumbai \
+skincare brand), before any LinkedIn post is drafted from them. Her posts \
+take one specific idea about skincare formulation, labels, testing, the \
+industry, Indian climate or running the brand, and explain it with her \
+reasoning and evidence.
+
+Score how well the note below could become one of those posts, from 0 to 10:
+
+- 9-10: a clear, specific idea with substance - a claim, mechanism, data \
+point, customer question or first-hand moment - that could carry a full post \
+almost as it stands.
+- 6-8: one recognisable idea worth a post, even if rough or brief. Drafting \
+can fill in the explanation, but the idea itself must be in the note.
+- 4-5: touches a relevant topic but has no actual point yet - a topic label, \
+a vague feeling, or a question with no angle.
+- 1-3: an abandoned half-sentence, a fragment, or something with no \
+post-worthy idea.
+- 0: a logistics or task reminder (calls, orders, meetings, deliveries, \
+errands), personal chatter, or unrelated to her work.
+
+Be strict. Most quick notes are reminders or fragments. Only score 6 or above \
+when you can say in one sentence what the post would argue. If in doubt, \
+score lower.
+
+Give a one-line reason, written to Meera, that names what the note has or \
+is missing.
+
+NOTE:
+{note}"""
+
+
+class NoteScore(BaseModel):
+    score: int = Field(ge=0, le=10)
+    reason: str
+
+
+async def score_note(note: str) -> NoteScore:
+    response = await gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=SCORING_PROMPT.format(note=note),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=NoteScore,
+        ),
+    )
+    response_text(response, "score")  # raises on a blocked or empty reply
+    if not isinstance(response.parsed, NoteScore):
+        raise GeminiError("Gemini's score couldn't be read.")
+    return response.parsed
 
 
 async def draft_post(note: str) -> str:
@@ -189,6 +244,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_note(note: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    try:
+        result = await score_note(note)
+    except GeminiError as e:
+        await update.effective_message.reply_text(f"Scoring failed: {e}")
+        return
+    except genai_errors.APIError as e:
+        log.exception("Gemini API error while scoring")
+        await update.effective_message.reply_text(
+            f"Scoring failed: the Gemini API returned an error ({e.code} {e.status}). "
+            "Try sending the note again in a minute."
+        )
+        return
+
+    log.info("Note scored %s/10: %s", result.score, result.reason)
+    if result.score < SCORE_THRESHOLD:
+        await update.effective_message.reply_text(
+            f"No draft made. This note scored {result.score}/10 "
+            f"(a draft needs {SCORE_THRESHOLD} or more).\n\n{result.reason}"
+        )
+        return
+    await update.effective_message.reply_text(
+        f"Note scored {result.score}/10: {result.reason}\n\nWriting the draft now..."
+    )
+
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
         draft = await draft_post(note)
