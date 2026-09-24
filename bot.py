@@ -1,14 +1,22 @@
 """Telegram bot: turns Meera's voice/text notes into LinkedIn post drafts.
 
-Flow: voice note -> Gemini transcription -> Gemini draft (with the voice skill
-as system instruction) -> full output sent back to the same chat. Never posts
-anywhere.
+Flow: voice note -> Gemini transcription -> Gemini score (weak notes stop
+here) -> Google News search for a current angle -> Gemini draft (with the voice
+skill as system instruction) -> full output sent back to the same chat. Never
+posts anywhere.
 """
 
+import html
 import logging
 import os
 import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import List, Optional
+
+import httpx
 
 from dotenv import load_dotenv
 from google import genai
@@ -151,18 +159,167 @@ async def score_note(note: str) -> NoteScore:
     return response.parsed
 
 
-async def draft_post(note: str) -> str:
+# ---------------------------------------------------------------------------
+# News angle
+# ---------------------------------------------------------------------------
+
+KEYWORDS_PROMPT = """\
+Pull 3 to 5 search terms from the note below, then combine them into one \
+short search phrase (2 to 6 words) that would find a recent news article on \
+the note's core topic: an ingredient, a label claim, a regulation, a study or \
+an industry practice. Use general terms a journalist would use. Leave out \
+Skinstinct, Meera and any other names of people.
+
+NOTE:
+{note}"""
+
+SUMMARY_PROMPT = """\
+Write a one-line summary (under 25 words) of what this news article is \
+about. You only have the headline and the publication, so describe what the \
+headline says and do not add any facts, numbers or claims that are not in it.
+
+HEADLINE: {headline}
+PUBLICATION: {source}"""
+
+
+class SearchTerms(BaseModel):
+    keywords: List[str]
+    phrase: str
+
+
+@dataclass
+class NewsItem:
+    headline: str
+    source: str
+    date: str
+    url: str
+    summary: str = ""
+
+
+async def extract_search_terms(note: str) -> SearchTerms:
+    response = await gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=KEYWORDS_PROMPT.format(note=note),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SearchTerms,
+        ),
+    )
+    response_text(response, "search terms")
+    if not isinstance(response.parsed, SearchTerms):
+        raise GeminiError("Gemini's search terms couldn't be read.")
+    return response.parsed
+
+
+async def search_google_news(query: str) -> Optional[NewsItem]:
+    """Return the top Google News result for query, or None if there isn't one."""
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        response = await client.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+        )
+        response.raise_for_status()
+    item = ET.fromstring(response.content).find("./channel/item")
+    if item is None:
+        return None
+
+    source = (item.findtext("source") or "").strip()
+    headline = html.unescape((item.findtext("title") or "").strip())
+    # Google appends " - Publication" to every headline.
+    if source and headline.endswith(f" - {source}"):
+        headline = headline[: -len(f" - {source}")]
+    try:
+        date = parsedate_to_datetime(item.findtext("pubDate") or "").strftime("%-d %b %Y")
+    except (TypeError, ValueError):
+        date = "date unknown"
+    return NewsItem(
+        headline=headline,
+        source=source or "unknown publication",
+        date=date,
+        url=(item.findtext("link") or "").strip(),
+    )
+
+
+async def find_news(note: str) -> Optional[NewsItem]:
+    terms = await extract_search_terms(note)
+    log.info("News search phrase: %r, keywords: %s", terms.phrase, terms.keywords)
+    # Prefer the last 30 days; widen the search if that finds nothing.
+    queries = [f"{terms.phrase} when:30d", terms.phrase, " ".join(terms.keywords[:3])]
+    for query in queries:
+        news = await search_google_news(query)
+        if news:
+            break
+    else:
+        return None
+
+    # The RSS feed carries only the headline, so the summary is written from it.
+    response = await gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=SUMMARY_PROMPT.format(headline=news.headline, source=news.source),
+    )
+    try:
+        news.summary = response_text(response, "summary")
+    except GeminiError:
+        news.summary = ""
+    return news
+
+
+def news_was_used(draft: str) -> bool:
+    """True unless the NEWS ANGLE section clearly says the item was not used.
+
+    If the section can't be found we assume it was used, so the verify flag is
+    never left off a draft that relies on the news item.
+    """
+    match = re.search(r"NEWS ANGLE\W*\n(.*?)(?=^\W*CORE IDEA|\Z)", draft, re.S | re.M)
+    if not match:
+        return True
+    angle = match.group(1).strip().lstrip("*[- ").lower()
+    return not angle.startswith("not used")
+
+
+def verify_flag(news: NewsItem) -> str:
+    rule = "\u2500" * 32
+    return (
+        f"{rule}\n"
+        f"NEWS SOURCE: {news.headline}\n"
+        f"FROM: {news.source} \u00b7 {news.date}\n"
+        f"LINK: {news.url}\n"
+        "\u26a0 Check this before publishing \u2013 you are the author of this claim\n"
+        f"{rule}"
+    )
+
+
+async def draft_post(note: str, news: Optional[NewsItem] = None) -> str:
+    if news:
+        angle = (
+            f"CURRENT ANGLE:\n"
+            f"Headline: {news.headline}\n"
+            f"Publication: {news.source}\n"
+            f"Date: {news.date}\n"
+            f"URL: {news.url}\n"
+            f"Summary (written from the headline only, not the article): {news.summary}\n\n"
+            "If this news item is genuinely relevant, use it to make the post "
+            "timely. If it doesn't fit naturally, ignore it. Only the headline "
+            "is known, so don't state anything about the article beyond what "
+            "the headline says."
+        )
+    else:
+        angle = "CURRENT ANGLE: none provided."
+
     response = await gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=(
             f"NOTE:\n{note}\n\n"
-            "CURRENT ANGLE: none provided.\n\n"
+            f"{angle}\n\n"
             "Write one LinkedIn post following the skill, and return "
             "all four sections in the output format it specifies."
         ),
         config=types.GenerateContentConfig(system_instruction=VOICE_SKILL),
     )
-    return response_text(response, "draft")
+    draft = response_text(response, "draft")
+    if news and news_was_used(draft):
+        draft += "\n\n" + verify_flag(news)
+    return draft
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +422,28 @@ async def handle_note(note: str, update: Update, context: ContextTypes.DEFAULT_T
             f"(a draft needs {SCORE_THRESHOLD} or more).\n\n{result.reason}"
         )
         return
+
+    # A failed news search shouldn't cost Meera her draft: say so and carry on.
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    try:
+        news = await find_news(note)
+        news_line = (
+            f"News angle found: {news.headline} ({news.source}, {news.date})"
+            if news
+            else "No matching news found, so the draft won't have a news angle."
+        )
+    except (GeminiError, genai_errors.APIError, httpx.HTTPError, ET.ParseError) as e:
+        log.exception("News search failed")
+        news = None
+        news_line = f"News search failed ({type(e).__name__}), so the draft won't have a news angle."
+
     await update.effective_message.reply_text(
-        f"Note scored {result.score}/10: {result.reason}\n\nWriting the draft now..."
+        f"Note scored {result.score}/10: {result.reason}\n\n{news_line}\n\nWriting the draft now..."
     )
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
-        draft = await draft_post(note)
+        draft = await draft_post(note, news)
     except GeminiError as e:
         await update.effective_message.reply_text(f"Drafting failed: {e}")
         return

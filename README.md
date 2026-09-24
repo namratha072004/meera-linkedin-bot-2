@@ -8,9 +8,27 @@ A Telegram bot that turns Meera Pillai's voice notes and text notes into LinkedI
 2. A voice note is transcribed with Gemini, and the bot replies with the transcript first so you can spot any mishearing.
 3. Gemini scores the note from 0 to 10 on whether it holds one idea worth a post, with a one-line reason. Task reminders and abandoned half-sentences score low; a specific claim, data point, customer question or first-hand moment scores high.
 4. If the score is below 6, the bot replies with the score and the reason, and no draft is made. The cutoff is `SCORE_THRESHOLD` in `bot.py`, and the scoring rules are `SCORING_PROMPT` just above it.
-5. If the score is 6 or above, the bot replies with the score, then sends the note to Gemini with `meera_voice_skill.md` as the system instruction.
-6. The bot replies with Gemini's full output: DRAFT, CHECK BEFORE POSTING, NEWS ANGLE and CORE IDEA.
-7. If the reply is longer than Telegram's 4,096-character limit, it is split into several messages. Whole sections are kept together when they fit. A section that is too long on its own is split between paragraphs, or between words if it has to be.
+5. If the score is 6 or above, the bot looks for a news angle:
+   - Gemini pulls 3–5 search terms from the note and combines them into a short search phrase.
+   - The bot searches Google News through its public RSS feed, which needs no key or account. It tries the last 30 days first, then any date.
+   - It takes the top result: headline, publication, date and link. The feed carries no article text, so Gemini writes the one-line summary from the headline alone.
+   - The bot replies with the score and the article it found.
+6. The note and the news item go to Gemini with `meera_voice_skill.md` as the system instruction, and this instruction: "If this news item is genuinely relevant, use it to make the post timely. If it doesn't fit naturally, ignore it."
+7. The bot replies with Gemini's full output: DRAFT, CHECK BEFORE POSTING, NEWS ANGLE and CORE IDEA. If the draft uses the news item, the code adds this block at the end. Gemini can't leave it out, because the code adds it, not Gemini:
+
+   ```
+   ────────────────────────────────
+   NEWS SOURCE: [headline]
+   FROM: [publication] · [date]
+   LINK: [url]
+   ⚠ Check this before publishing – you are the author of this claim
+   ────────────────────────────────
+   ```
+
+   The block is left off only when the NEWS ANGLE section says "Not used". If that section can't be found, the block is added anyway.
+
+   If the news search fails, the bot says so and still writes the draft, just without a news angle.
+8. If the reply is longer than Telegram's 4,096-character limit, it is split into several messages. Whole sections are kept together when they fit. A section that is too long on its own is split between paragraphs, or between words if it has to be.
 
 Anyone who finds the bot in Telegram can use it, and every note they send is billed to your Gemini API key. Keep the bot's username private. The bot only answers in private chats, not in groups.
 
