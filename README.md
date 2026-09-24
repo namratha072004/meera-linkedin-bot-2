@@ -39,11 +39,18 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Open `.env` and fill in both values:
+Open `.env` and fill in the values:
 
 ```
 TELEGRAM_BOT_TOKEN=123456:ABC-...
 GEMINI_API_KEY=...
+TELEGRAM_WEBHOOK_SECRET=...
+```
+
+`TELEGRAM_WEBHOOK_SECRET` is only needed for Vercel. It can be any long random string. Generate one with:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 Optional settings:
@@ -51,13 +58,31 @@ Optional settings:
 - `GEMINI_MODEL`: defaults to `gemini-3.8-flash`. It's used for both transcription and drafting.
 - `VOICE_SKILL_PATH`: defaults to `meera_voice_skill.md` next to `bot.py`. Edit that file to change how drafts are written. Restart the bot after editing it.
 
-### 5. Run
+### 5. Run it
+
+There are two ways to run the bot. Use one or the other, not both at once.
+
+**On your computer.** This is good for testing:
 
 ```bash
 python bot.py
 ```
 
-Open your bot in Telegram, send `/start`, then send a note. The bot runs for as long as the terminal is open. Stop it with Ctrl+C.
+The bot runs for as long as the terminal is open. Stop it with Ctrl+C. Starting it this way turns off the Vercel webhook, so run `set_webhook.py` again (step 3 below) when you go back to Vercel.
+
+**On Vercel.** This runs all the time, with no computer on:
+
+1. Import the GitHub repository at https://vercel.com/new. Vercel finds `app.py` and `vercel.json` on its own, so leave the build settings as they are.
+2. Under **Settings → Environment Variables**, add `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY` and `TELEGRAM_WEBHOOK_SECRET`, using the same values as your `.env`. Then redeploy from the **Deployments** tab so the new values are picked up.
+3. Tell Telegram where to send messages. Use your deployment's URL:
+
+   ```bash
+   python set_webhook.py https://your-project.vercel.app
+   ```
+
+Opening `https://your-project.vercel.app` in a browser should show "Meera draft bot is running."
+
+Then open your bot in Telegram, send `/start`, and send a note.
 
 ## Errors
 
@@ -68,9 +93,11 @@ If a step fails, the bot replies with a plain message saying which step failed, 
 - `Drafting failed: the Gemini API returned an error (429 RESOURCE_EXHAUSTED). ...`
 - `Drafting failed: Gemini blocked the draft (SAFETY).`
 
-The full error details are printed in the terminal where `bot.py` is running.
+The full error details are printed in the terminal where `bot.py` is running. On Vercel, they're under the project's **Logs** tab.
 
 If the bot starts and then stops straight away, read the terminal. It tells you which `.env` value is missing or which file it couldn't find.
+
+If the bot doesn't answer on Vercel, run `python set_webhook.py https://your-project.vercel.app` again. It prints the last delivery error Telegram saw, for example a 403, which means `TELEGRAM_WEBHOOK_SECRET` on Vercel doesn't match your `.env`.
 
 ## Notes
 

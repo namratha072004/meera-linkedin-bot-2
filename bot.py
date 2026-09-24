@@ -253,17 +253,20 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("Could not send error message")
 
 
-def main() -> None:
+def build_application() -> Application:
     private = filters.ChatType.PRIVATE
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app =Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start, filters=private))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(private & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_error_handler(on_error)
+    return app
 
-    log.info("Bot running with model %s", GEMINI_MODEL)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main() -> None:
+    """Run locally by polling Telegram. This removes any webhook set for Vercel."""
+    log.info("Bot running locally (polling) with model %s", GEMINI_MODEL)
+    build_application().run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
